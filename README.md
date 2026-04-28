@@ -159,7 +159,7 @@ Inference latency must stay under 100 ms for safety-critical events. Cloud round
 
 ```bash
 # Clone repository
-git clone https://github.com/<your-username>/jetson-clinical-edge-monitor.git
+git clone https://github.com/martinvgl/jetson-clinical-edge-monitor.git
 cd jetson-clinical-edge-monitor
 
 # Install system dependencies
