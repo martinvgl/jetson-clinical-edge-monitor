@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Test captures (privacy-first, no images committed)
+*.jpg
+*.png
+*.mp4
+
+# Local settings
+.vscode/
+__pycache__/
+*.pyc
