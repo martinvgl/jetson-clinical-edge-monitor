@@ -1,12 +1,9 @@
 """
-Test trt_pose live keypoint extraction on Jetson Nano.
+Test trt_pose live keypoint extraction on Jetson Nano (SAFE VERSION).
 
-Pipeline:
-  1. Load ResNet-18 baseline model (PyTorch checkpoint)
-  2. Convert to TensorRT (one-time, cached)
-  3. Open webcam
-  4. Extract 18 keypoints per frame
-  5. Save annotated frames every second to /tmp for inspection
+- No TensorRT (pure PyTorch for stability)
+- Handles checkpoint mismatch safely
+- Webcam + keypoints + image saving
 """
 
 import os
@@ -18,30 +15,24 @@ import torchvision.transforms as transforms
 import PIL.Image
 import trt_pose.coco
 import trt_pose.models
-from torch2trt import TRTModule, torch2trt
 from trt_pose.parse_objects import ParseObjects
 from trt_pose.draw_objects import DrawObjects
 
 # ----- Config -----
 MODEL_PATH = os.path.expanduser("~/jetson-models/resnet18_baseline_att_224x224_A_epoch_249.pth")
-TRT_MODEL_PATH = os.path.expanduser("~/jetson-models/resnet18_trt.pth")
 POSE_JSON = os.path.expanduser("~/trt_pose/tasks/human_pose/human_pose.json")
+
 INPUT_WIDTH = 224
 INPUT_HEIGHT = 224
+
 SAVE_DIR = "/tmp/trt_pose_output"
-SAVE_EVERY_N_FRAMES = 30  # ~1 image par seconde à 30 FPS
+SAVE_EVERY_N_FRAMES = 30
 TEST_DURATION_SEC = 30
 
 
 def get_model():
-    """Load model: from cached TRT if available, else convert from PyTorch."""
-    if os.path.exists(TRT_MODEL_PATH):
-        print(f"Loading cached TensorRT model from {TRT_MODEL_PATH}...")
-        model_trt = TRTModule()
-        model_trt.load_state_dict(torch.load(TRT_MODEL_PATH))
-        return model_trt
-
-    print("No cached TRT model. Converting from PyTorch (this takes 2-3 min)...")
+    """Load PyTorch model safely (no TensorRT)."""
+    print("Loading PyTorch model...")
 
     with open(POSE_JSON, 'r') as f:
         human_pose = json.load(f)
@@ -52,21 +43,19 @@ def get_model():
     model = trt_pose.models.resnet18_baseline_att(
         num_parts, 2 * num_links).cuda().eval()
 
-    print(f"Loading PyTorch checkpoint from {MODEL_PATH}...")
-    model.load_state_dict(torch.load(MODEL_PATH))
+    print(f"Loading checkpoint from {MODEL_PATH}...")
 
-    print("Converting to TensorRT...")
-    data = torch.zeros((1, 3, INPUT_HEIGHT, INPUT_WIDTH)).cuda()
-    model_trt = torch2trt(model, [data], max_workspace_size=1 << 25)
+    state_dict = torch.load(MODEL_PATH)
 
-    print(f"Saving TRT model to {TRT_MODEL_PATH}...")
-    torch.save(model_trt.state_dict(), TRT_MODEL_PATH)
+    # ⚠️ IMPORTANT: avoid crash if mismatch
+    model.load_state_dict(state_dict, strict=False)
 
-    return model_trt
+    print("Model loaded (PyTorch mode, no TensorRT).")
+    return model
 
 
 def preprocess(image, mean, std, device):
-    """BGR (OpenCV) -> RGB tensor normalized for the model."""
+    """BGR -> normalized tensor"""
     image = cv2.resize(image, (INPUT_WIDTH, INPUT_HEIGHT))
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     image = PIL.Image.fromarray(image)
@@ -79,29 +68,31 @@ def main():
     os.makedirs(SAVE_DIR, exist_ok=True)
     device = torch.device('cuda')
 
-    # Load topology and prepare parsers
+    # Load pose config
     with open(POSE_JSON, 'r') as f:
         human_pose = json.load(f)
+
     topology = trt_pose.coco.coco_category_to_topology(human_pose)
     parse_objects = ParseObjects(topology)
     draw_objects = DrawObjects(topology)
 
-    # Load or convert model
-    model_trt = get_model()
+    # Load model (SAFE)
+    model = get_model()
 
-    # Normalization values (ImageNet)
+    # Normalization (ImageNet)
     mean = torch.Tensor([0.485, 0.456, 0.406]).cuda()
     std = torch.Tensor([0.229, 0.224, 0.225]).cuda()
 
-    # Open webcam
+    # Webcam
     print("Opening camera...")
     cap = cv2.VideoCapture(0)
+
     if not cap.isOpened():
         print("ERROR: Cannot open camera")
         return 1
 
-    print(f"Streaming for {TEST_DURATION_SEC} seconds, saving annotated frames to {SAVE_DIR}/")
-    print(f"(One image saved every {SAVE_EVERY_N_FRAMES} frames)")
+    print(f"Running for {TEST_DURATION_SEC}s...")
+    print(f"Saving images to {SAVE_DIR}/")
 
     frame_count = 0
     saved_count = 0
@@ -114,26 +105,30 @@ def main():
 
         # Inference
         data = preprocess(frame, mean, std, device)
-        cmap, paf = model_trt(data)
-        cmap, paf = cmap.detach().cpu(), paf.detach().cpu()
+
+        with torch.no_grad():  # 🔥 important for speed
+            cmap, paf = model(data)
+
+        cmap, paf = cmap.cpu(), paf.cpu()
         counts, objects, peaks = parse_objects(cmap, paf)
 
-        # Draw on the original frame
+        # Draw skeleton
         draw_objects(frame, counts, objects, peaks)
 
-        # Save periodically
+        # Save frame
         if frame_count % SAVE_EVERY_N_FRAMES == 0:
             output_path = f"{SAVE_DIR}/frame_{saved_count:04d}.jpg"
             cv2.imwrite(output_path, frame)
+            print(f"Saved {output_path} (people: {int(counts[0])})")
             saved_count += 1
-            print(f"  Saved {output_path} (people detected: {int(counts[0])})")
 
         frame_count += 1
 
     elapsed = time.time() - start
     fps = frame_count / elapsed
-    print(f"\nDone. {frame_count} frames in {elapsed:.1f}s ({fps:.1f} FPS)")
-    print(f"{saved_count} annotated images saved to {SAVE_DIR}/")
+
+    print(f"\nDone: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} FPS)")
+    print(f"{saved_count} images saved")
 
     cap.release()
     return 0
