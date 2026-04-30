@@ -1,8 +1,5 @@
 # Privacy-First Clinical Edge Monitor
 
-
-
-[![Jetson](https://img.shields.io/badge/Jetson-Nano-76B900.svg)](https://developer.nvidia.com/embedded/jetson-nano-developer-kit)
 [![Status](https://img.shields.io/badge/status-active%20development-yellow)]()
 [![Hardware](https://img.shields.io/badge/hardware-Jetson%20Nano-green)]()
 [![Python](https://img.shields.io/badge/python-3.6-blue)]()
