@@ -175,6 +175,12 @@ class EventDetector:
         features = _extract_keypoints(pose, image_height)
         if features is None:
             return None
+        
+                # DEBUG: log raw features (remove in production)
+        if int(timestamp) != int(getattr(self, '_last_log_t', 0)):
+            print(f"  [debug] com_y_norm={features['com_y_norm']:.3f} "
+                  f"angle={features['trunk_angle_deg']:.1f}°")
+            self._last_log_t = timestamp
 
         # Update histories
         self._com_history.append((timestamp, features["com_y_norm"]))
