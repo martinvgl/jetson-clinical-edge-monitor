@@ -1,14 +1,13 @@
 """
-Test trt_pose live keypoint extraction on Jetson Nano (SAFE VERSION).
+trt_pose live keypoint streaming via MJPEG over HTTP.
 
-- No TensorRT (pure PyTorch for stability)
-- Handles checkpoint mismatch safely
-- Webcam + keypoints + image saving
+Open http://<jetson_ip>:5000/ in a browser to see the live feed
+with skeletons drawn.
 """
 
 import os
 import json
-import time
+import threading
 import cv2
 import torch
 import torchvision.transforms as transforms
@@ -17,45 +16,38 @@ import trt_pose.coco
 import trt_pose.models
 from trt_pose.parse_objects import ParseObjects
 from trt_pose.draw_objects import DrawObjects
+from flask import Flask, Response
 
 # ----- Config -----
 MODEL_PATH = os.path.expanduser("~/jetson-models/resnet18_baseline_att_224x224_A_epoch_249.pth")
 POSE_JSON = os.path.expanduser("~/trt_pose/tasks/human_pose/human_pose.json")
-
 INPUT_WIDTH = 224
 INPUT_HEIGHT = 224
+HTTP_PORT = 5000
 
-SAVE_DIR = "/tmp/trt_pose_output"
-SAVE_EVERY_N_FRAMES = 30
-TEST_DURATION_SEC = 30
+# ----- Globals (shared between threads) -----
+output_frame = None
+frame_lock = threading.Lock()
 
 
 def get_model():
-    """Load PyTorch model safely (no TensorRT)."""
     print("Loading PyTorch model...")
-
     with open(POSE_JSON, 'r') as f:
         human_pose = json.load(f)
-
     num_parts = len(human_pose['keypoints'])
     num_links = len(human_pose['skeleton'])
-
     model = trt_pose.models.resnet18_baseline_att(
         num_parts, 2 * num_links).cuda().eval()
-
     print(f"Loading checkpoint from {MODEL_PATH}...")
-
     state_dict = torch.load(MODEL_PATH)
-
-    # ⚠️ IMPORTANT: avoid crash if mismatch
-    model.load_state_dict(state_dict, strict=False)
-
-    print("Model loaded (PyTorch mode, no TensorRT).")
+    result = model.load_state_dict(state_dict, strict=False)
+    print(f"  Missing keys: {len(result.missing_keys)}")
+    print(f"  Unexpected keys: {len(result.unexpected_keys)}")
+    print("Model loaded.")
     return model
 
 
 def preprocess(image, mean, std, device):
-    """BGR -> normalized tensor"""
     image = cv2.resize(image, (INPUT_WIDTH, INPUT_HEIGHT))
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     image = PIL.Image.fromarray(image)
@@ -64,75 +56,96 @@ def preprocess(image, mean, std, device):
     return image[None, ...]
 
 
-def main():
-    os.makedirs(SAVE_DIR, exist_ok=True)
+def inference_loop():
+    """Background thread: capture + inference + update output_frame."""
+    global output_frame
+
     device = torch.device('cuda')
 
-    # Load pose config
     with open(POSE_JSON, 'r') as f:
         human_pose = json.load(f)
-
     topology = trt_pose.coco.coco_category_to_topology(human_pose)
     parse_objects = ParseObjects(topology)
     draw_objects = DrawObjects(topology)
 
-    # Load model (SAFE)
     model = get_model()
-
-    # Normalization (ImageNet)
     mean = torch.Tensor([0.485, 0.456, 0.406]).cuda()
     std = torch.Tensor([0.229, 0.224, 0.225]).cuda()
 
-    # Webcam
     print("Opening camera...")
     cap = cv2.VideoCapture(0)
-
     if not cap.isOpened():
         print("ERROR: Cannot open camera")
-        return 1
+        return
 
-    print(f"Running for {TEST_DURATION_SEC}s...")
-    print(f"Saving images to {SAVE_DIR}/")
+    print("Inference loop started.")
 
-    frame_count = 0
-    saved_count = 0
-    start = time.time()
-
-    while time.time() - start < TEST_DURATION_SEC:
+    while True:
         ret, frame = cap.read()
         if not ret:
-            break
+            continue
 
-        # Inference
         data = preprocess(frame, mean, std, device)
-
-        with torch.no_grad():  # 🔥 important for speed
+        with torch.no_grad():
             cmap, paf = model(data)
-
         cmap, paf = cmap.cpu(), paf.cpu()
         counts, objects, peaks = parse_objects(cmap, paf)
-
-        # Draw skeleton
         draw_objects(frame, counts, objects, peaks)
 
-        # Save frame
-        if frame_count % SAVE_EVERY_N_FRAMES == 0:
-            output_path = f"{SAVE_DIR}/frame_{saved_count:04d}.jpg"
-            cv2.imwrite(output_path, frame)
-            print(f"Saved {output_path} (people: {int(counts[0])})")
-            saved_count += 1
+        # Annotate frame with people count
+        cv2.putText(frame, f"People: {int(counts[0])}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        frame_count += 1
-
-    elapsed = time.time() - start
-    fps = frame_count / elapsed
-
-    print(f"\nDone: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} FPS)")
-    print(f"{saved_count} images saved")
-
-    cap.release()
-    return 0
+        with frame_lock:
+            output_frame = frame.copy()
 
 
-if __name__ == "__main__":
-    exit(main())
+def generate_mjpeg():
+    """Generator that yields the latest frame as MJPEG."""
+    global output_frame
+    while True:
+        with frame_lock:
+            if output_frame is None:
+                continue
+            ret, jpeg = cv2.imencode('.jpg', output_frame)
+            if not ret:
+                continue
+            frame_bytes = jpeg.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+
+# ----- Flask app -----
+app = Flask(__name__)
+
+
+@app.route('/')
+def index():
+    return """
+    <html>
+      <head><title>Jetson Pose Stream</title></head>
+      <body style="background:#222; color:#eee; font-family:sans-serif; text-align:center;">
+        <h1>Jetson Clinical Edge Monitor - Live Feed</h1>
+        <img src="/video" width="640" />
+        <p>Press Ctrl+C in the terminal to stop the server</p>
+      </body>
+    </html>
+    """
+
+
+@app.route('/video')
+def video():
+    return Response(generate_mjpeg(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+if __name__ == '__main__':
+    # Start inference in a background thread
+    t = threading.Thread(target=inference_loop, daemon=True)
+    t.start()
+
+    # Start Flask
+    print(f"Server starting on http://0.0.0.0:{HTTP_PORT}/")
+    print(f"Open http://172.17.69.114:{HTTP_PORT}/ in your PC browser")
+    app.run(host='0.0.0.0', port=HTTP_PORT, threaded=True, debug=False)
