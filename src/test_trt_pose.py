@@ -57,7 +57,7 @@ def get_model():
 
     print("Converting to TensorRT...")
     data = torch.zeros((1, 3, INPUT_HEIGHT, INPUT_WIDTH)).cuda()
-    model_trt = torch2trt(model, [data], fp16_mode=True, max_workspace_size=1 << 25)
+    model_trt = torch2trt(model, [data], max_workspace_size=1 << 25)
 
     print(f"Saving TRT model to {TRT_MODEL_PATH}...")
     torch.save(model_trt.state_dict(), TRT_MODEL_PATH)
